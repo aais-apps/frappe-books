@@ -423,7 +423,8 @@ export default defineComponent({
       if (this.schemaName == ModelNameEnum.SalesInvoice && this.doc?.is_pos) {
         templateName = this.fyo.singles.Defaults?.pos_print_template;
 
-        const posProfileName = this.fyo.singles.POSSettings?.pos_profile;
+        // The profile the sale was made with, so it prints the same for everyone.
+        const posProfileName = this.doc.pos_profile as string | undefined;
         const profileTemplate =
           posProfileName &&
           (await getValue(
