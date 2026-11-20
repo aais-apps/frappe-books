@@ -11,12 +11,15 @@ from frappe_books.frappe_books.doctype.books_pos_closing_shift.test_books_pos_cl
 	close_shift,
 )
 from frappe_books.frappe_books.doctype.books_pos_opening_shift.test_books_pos_opening_shift import (
+	make_profile,
+	open_shift,
 	start_pos_shift,
 )
 from frappe_books.frappe_books.doctype.books_sales_invoice.books_sales_invoice import (
 	make_payment,
 	pay_pos_invoice,
 )
+from frappe_books.patches import set_pos_invoice_profiles
 from frappe_books.tests.accounting import (
 	ensure_user,
 	make_account,
@@ -165,7 +168,7 @@ class IntegrationTestPosPayments(IntegrationTestCase):
 
 		payment = frappe.get_doc("Books Payment", counter_payments(refund)[0])
 		self.assertEqual((payment.payment_type, payment.payment_account), ("Pay", self.counter))
-		self.assertEqual(transacted_amounts(invoice.date, now_datetime()), {"Cash": 0})
+		self.assertEqual(transacted_amounts(invoice.date, now_datetime(), frappe.session.user), {"Cash": 0})
 
 	def test_pos_cash_without_a_shift_goes_to_the_methods_account(self):
 		invoice = self.make_pos_invoice()
@@ -197,6 +200,18 @@ class IntegrationTestPosPayments(IntegrationTestCase):
 
 		with self.assertRaisesRegex(frappe.ValidationError, "Open a POS shift"):
 			pay_pos_invoice(invoice.name, [{"payment_method": "Cash", "amount": 180}])
+
+	def test_pos_cash_takes_the_counter_only_in_the_payers_own_shift(self):
+		invoice = self.make_pos_invoice()
+		invoice.submit()
+		drawer = make_account("POS Drawer Cash", account_type="Cash").name
+		frappe.db.set_value("Books Payment Method", "Cash", "account", drawer)
+
+		# Another user's open shift does not count.
+		with self.set_user(ensure_user("pos-shiftless@example.com", "Books User")):
+			self.assertEqual(make_payment(invoice.name).payment_account, drawer)
+			with self.assertRaisesRegex(frappe.ValidationError, "Open a POS shift"):
+				pay_pos_invoice(invoice.name, [{"payment_method": "Cash", "amount": 180}])
 
 	def test_a_cashier_sells_and_refunds_at_the_counter_but_cannot_cancel_or_pay(self):
 		with self.set_user(self.make_cashier()):
@@ -260,6 +275,32 @@ class IntegrationTestPosPayments(IntegrationTestCase):
 		self.assertEqual(cash_amounts(closing).difference_amount, 0)
 		self.assertEqual(account_balance(self.counter), 0)
 
+	def test_a_pos_sale_keeps_the_profile_it_was_sold_with(self):
+		profile = make_profile(can_change_rate=1, can_edit_discount=1)
+		shift = open_shift_name()
+		frappe.db.set_value("Books Pos Opening Shift", shift, "pos_profile", profile)
+		invoice = self.make_pos_invoice(payments=[{"payment_method": "Cash", "amount": 180}])
+		invoice.submit()
+		# The return is made with another profile, and its own copy is dropped.
+		frappe.db.set_value("Books Pos Opening Shift", shift, "pos_profile", make_profile())
+		refund = map_return(invoice.doctype, invoice.name)
+		refund.pos_profile = None
+
+		refund.insert()
+
+		self.assertEqual((invoice.pos_profile, refund.pos_profile), (profile, profile))
+
+	def test_the_patch_records_the_profile_of_existing_pos_sales(self):
+		invoice = self.make_pos_invoice()
+		invoice.submit()
+		invoice.db_set("pos_profile", None)
+		profile = make_profile()
+		frappe.db.set_single_value("Books Pos Settings", "pos_profile", profile)
+
+		set_pos_invoice_profiles.execute()
+
+		self.assertEqual(invoice.reload().pos_profile, profile)
+
 	def test_pos_invoice_is_dated_at_checkout(self):
 		yesterday = add_days(now_datetime(), -1)
 		held = self.make_pos_invoice(date=yesterday)
@@ -290,7 +331,11 @@ class IntegrationTestPosPayments(IntegrationTestCase):
 	def make_cashier(self):
 		# A cashier cannot pick the account, so a POS sale takes this one, as set up.
 		frappe.db.set_single_value("Books Pos Settings", "default_account", self.receivable.name)
-		return ensure_user("pos-only-cashier@example.com", "Books Cashier")
+		cashier = ensure_user("pos-only-cashier@example.com", "Books Cashier")
+		with self.set_user(cashier):
+			# A cashier sells in their own shift.
+			open_shift(0)
+		return cashier
 
 	def make_pos_invoice(self, **values):
 		return make_invoice(
